@@ -1,6 +1,9 @@
 #include <queue>
 #include <vector>
 #include <iostream>
+#include <functional>
+#include <memory>
+#include <future>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,16 +39,22 @@ private:
 
     pthread_mutex_t queue_mutex;
 
-    queue<job_t> job_queue;
+    vector<bool> thread_idle;
+    queue<function<void()>> job_queue;
+
+    // queue<job_t> job_queue;
 
     struct timespec tim;
    
 public:
     ThreadPool(int);
     ~ThreadPool();
-    void addJob(job_funct_t, void*);
+    template<typename F, typename...Args>
+    void addJob(F&& f, Args&&... args);
+    // void addJob(job_funct_t, void*);
     void fetchJob(int);
     bool jobsRemaining();
+    void waitComplete();
     void joinThreads();
     void threadLoop(int);
 };
@@ -59,7 +68,6 @@ ThreadPool::ThreadPool(int thread_count)
     this->tim.tv_nsec = JOB_CHECK_DELAY;
 
     this->threads.resize(thread_count);
-    this->job_queue = queue<job_t>();
     
     for (int i = 0; i < thread_count; i++) {
         loop_helper_args_t* lh_args = new loop_helper_args_t;
@@ -67,26 +75,47 @@ ThreadPool::ThreadPool(int thread_count)
         lh_args->pool = this;
 
         pthread_create(&this->threads[i], NULL, threadLoopHelper, lh_args);
+        this->thread_idle.push_back(true);
     }
 }
 
-void ThreadPool::addJob(void (*f)(void*), void* params) {
-    job_t job;
-    job.f = f;
-    job.params = params;
+template<typename F, typename...Args>
+void ThreadPool::addJob(F&& f, Args&&... args) {
+	// Create a function with bounded parameters ready to execute
+	function<decltype(f(args...))()> func = bind(forward<F>(f), forward<Args>(args)...);
+	// Encapsulate it into a shared ptr in order to be able to copy construct / assign 
+	auto task_ptr = make_shared<packaged_task<decltype(f(args...))()>>(func);
+
+	// Wrap packaged task into void function
+	function<void()> wrapper_func = [task_ptr]() {
+	  (*task_ptr)(); 
+	};
 
     pthread_mutex_lock(&this->queue_mutex);
 
-    this->job_queue.push(job);
+    this->job_queue.push(wrapper_func);
 
     pthread_mutex_unlock(&this->queue_mutex);
 }
+
+// void ThreadPool::addJob(void (*f)(void*), void* params) {
+//     job_t job;
+//     job.f = f;
+//     job.params = params;
+
+//     pthread_mutex_lock(&this->queue_mutex);
+
+//     this->job_queue.push(job);
+
+//     pthread_mutex_unlock(&this->queue_mutex);
+// }
 
 void ThreadPool::fetchJob(int tid) {
 
     pthread_mutex_lock(&this->queue_mutex);
     
-    job_t job;
+    // job_t job;
+    function<void()> job;
     bool job_fetched = false;
     
     if (!this->job_queue.empty()) {
@@ -98,7 +127,9 @@ void ThreadPool::fetchJob(int tid) {
     pthread_mutex_unlock(&this->queue_mutex);
 
     if (job_fetched) {
-        job.f(job.params);
+        this->thread_idle[tid] = false;
+        job();
+        this->thread_idle[tid] = true;
     }
 }
 
@@ -111,6 +142,25 @@ bool ThreadPool::jobsRemaining() {
     pthread_mutex_unlock(&this->queue_mutex);
 
     return remaining;
+}
+
+
+void ThreadPool::waitComplete() {
+    bool complete = false;
+
+    while(!complete) {
+        pthread_mutex_lock(&this->queue_mutex);
+        complete = this->job_queue.empty();
+        pthread_mutex_unlock(&this->queue_mutex);
+
+        for (int i = 0; i < this->thread_count; i++) {
+            if (!this->thread_idle[i]) {
+                complete = false;
+                break;
+            }
+        }
+        nanosleep(&this->tim, NULL);
+    }
 }
 
 void ThreadPool::joinThreads() {
